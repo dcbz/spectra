@@ -1,0 +1,91 @@
+rules:
+  - name: sudo failure
+    pattern: "sudo: .*authentication failure"
+    severity: high
+    color: "#FF61D8"
+    tags: [auth, sudo]
+    description: Alerts on classic sudo authentication failures that often precede brute-force attempts.
+  - name: ssh brute force
+    pattern: 'Failed password for (?P<user>\S+) from (?P<ip>\d+\.\d+\.\d+\.\d+)'
+    severity: critical
+    color: "#FF5E5B"
+    tags: [ssh, brute]
+    description: High signal for repeated SSH password guesses with captured username + IP.
+  - name: kernel warning
+    pattern: 'kernel: \[.*\] warning'
+    severity: medium
+    color: "#FFC857"
+    tags: [kernel]
+    description: Surfaces kernel warning lines to keep an eye on host stability issues.
+  - name: service restart
+    pattern: 'systemd\[.*\]: Starting'
+    severity: low
+    color: "#7AF7FF"
+    tags: [systemd]
+    description: Notes whenever systemd begins a unit, useful for spotting noisy services.
+  - name: sudo escalation
+    pattern: 'sudo: pam_unix\(sudo:session\): session opened for user root by (?P<caller>\S+) \(uid=0\)'
+    severity: high
+    color: "#FFB347"
+    tags: [sudo, escalation]
+    description: Captures successful sudo sessions to root so you can validate each elevation.
+  - name: passwd tamper
+    pattern: 'passwd\[\d+\]: pam_unix\(passwd:chauthtok\): password changed for (?P<user>\S+)'
+    severity: high
+    color: "#FF6B6B"
+    tags: [auth, passwd]
+    description: Flags password changes so maintenance windows can be audited.
+  - name: shadow read attempt
+    pattern: 'COMMAND=/\w*/?(?:cat|less|more|cp)\s+/etc/shadow'
+    severity: critical
+    color: "#D7263D"
+    tags: [credential, shadow]
+    description: Highlights direct access to /etc/shadow via sudo or audit records.
+  - name: kernel oops
+    pattern: 'kernel: \[.*\]\s+(?:BUG|Oops|stack guard|segfault)'
+    severity: high
+    color: "#F8C537"
+    tags: [kernel, stability]
+    description: Detects kernel-space crashes that could follow exploit attempts.
+  - name: core dump detected
+    pattern: 'systemd-coredump\[\d+\]:'
+    severity: medium
+    color: "#7AF7FF"
+    tags: [systemd, crash]
+    description: Raises visibility whenever systemd captures a core dump.
+  - name: sshd reload
+    pattern: 'sshd\[\d+\]: Received SIGHUP; restarting'
+    severity: medium
+    color: "#6A4C93"
+    tags: [ssh, config]
+    description: Ensures unexpected SSH daemon reloads are reviewed.
+  - name: unit failed state
+    pattern: 'systemd\[.*\]: Unit (?P<service>\S+) entered failed state'
+    severity: medium
+    color: "#F4D35E"
+    tags: [systemd, failure]
+    description: Alerts when services thrash into failed state loops.
+  - name: unexpected web shell
+    pattern: 'session opened for user (?:www-data|nginx|apache|http) by \(uid=0\)'
+    severity: critical
+    color: "#C9184A"
+    tags: [shell, web]
+    description: Session openings for service accounts usually indicate shell pivots.
+  - name: netcat listener
+    pattern: 'COMMAND=/\w*/?(?:nc|ncat|socat)\s+-l'
+    severity: high
+    color: "#2EC4B6"
+    tags: [network, listener]
+    description: Watches for ad-hoc reverse shell tooling launched via sudo.
+  - name: cron edit
+    pattern: 'crontab\[\d+\]: (?:Replacing|New) crontab for (?P<user>\S+)'
+    severity: medium
+    color: "#FF9770"
+    tags: [cron, persistence]
+    description: Highlights cron table modifications that may introduce persistence.
+  - name: kernel module failure
+    pattern: 'modprobe: FATAL: Module (?P<module>\S+) not found'
+    severity: low
+    color: "#A0E8AF"
+    tags: [kernel, module]
+    description: Notes failed module loads which can hint at rootkit activity or misconfiguration.
