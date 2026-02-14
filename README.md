@@ -26,6 +26,10 @@ Navigation: `↑`/`↓` move selection, `PgUp`/`PgDn` page through results, `Ent
 
 Add `--show-all` to include every log line, and `--min-severity=high` (or similar) to dial-in the signal you want.
 
+## Screenshots
+
+![Spectra Watch UI](spectra.png)
+
 ## Rules Configuration
 
 Rules live in YAML (`configs/example.rules.yaml`). Each rule supports:
