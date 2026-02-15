@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
@@ -387,7 +388,6 @@ func (m *Model) openDetail() {
 	}
 	m.detailOpen = true
 	m.updateDetailViewportSize()
-	m.refreshDetailContent()
 	m.detailViewport.GotoTop()
 }
 
@@ -402,7 +402,12 @@ func (m *Model) refreshDetailContent() {
 	} else {
 		m.detailContent = m.buildDetailContent(line)
 	}
-	m.detailViewport.SetContent(m.detailContent)
+	width := m.detailViewport.Width
+	if width <= 0 {
+		width = 60
+	}
+	wrapped := wrapText(m.detailContent, width)
+	m.detailViewport.SetContent(wrapped)
 }
 
 func (m Model) buildDetailContent(line displayLine) string {
@@ -477,6 +482,7 @@ func (m *Model) updateDetailViewportSize() {
 	}
 	m.detailViewport.Width = innerWidth
 	m.detailViewport.Height = innerHeight
+	m.refreshDetailContent()
 }
 
 func (m Model) renderDetailModal() string {
@@ -795,6 +801,62 @@ func clamp(val, min, max int) int {
 		return max
 	}
 	return val
+}
+
+func wrapText(value string, width int) string {
+	if width <= 0 {
+		return value
+	}
+	segments := strings.Split(value, "\n")
+	wrapped := make([]string, 0, len(segments))
+	for _, segment := range segments {
+		for _, line := range wrapLine(segment, width) {
+			wrapped = append(wrapped, line)
+		}
+	}
+	return strings.Join(wrapped, "\n")
+}
+
+func wrapLine(line string, width int) []string {
+	if width <= 0 {
+		return []string{line}
+	}
+	runes := []rune(line)
+	if len(runes) == 0 {
+		return []string{""}
+	}
+	var lines []string
+	for len(runes) > width {
+		split := width
+		for i := width; i > 0; i-- {
+			if unicode.IsSpace(runes[i-1]) {
+				split = i
+				break
+			}
+		}
+		segment := strings.TrimRightFunc(string(runes[:split]), unicode.IsSpace)
+		if segment == "" {
+			segment = string(runes[:split])
+		}
+		lines = append(lines, segment)
+		runes = trimLeadingSpaces(runes[split:])
+		if len(runes) == 0 {
+			return append(lines, "")
+		}
+	}
+	lines = append(lines, string(runes))
+	return lines
+}
+
+func trimLeadingSpaces(runes []rune) []rune {
+	idx := 0
+	for idx < len(runes) {
+		if runes[idx] != ' ' {
+			break
+		}
+		idx++
+	}
+	return runes[idx:]
 }
 
 var eyeFrames = []string{
