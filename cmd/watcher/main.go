@@ -13,10 +13,10 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"watcher/internal/pipeline"
+	"watcher/internal/config"
 	"watcher/internal/rules"
+	"watcher/internal/runtime"
 	"watcher/internal/tui"
-	"watcher/internal/watch"
 )
 
 func main() {
@@ -46,21 +46,24 @@ func main() {
 		log.Fatalf("min severity: %v", err)
 	}
 
-	logCh, err := watch.TailFiles(ctx, files)
-	if err != nil {
-		log.Fatalf("tail files: %v", err)
+	ctrl := runtime.NewController(ctx, ruleSet, *showAllFlag, minSeverity)
+	if err := ctrl.Apply(runtime.Selection{Files: files}); err != nil {
+		log.Fatalf("start tailing: %v", err)
 	}
 
-	stream := pipeline.New(ruleSet, *showAllFlag, minSeverity)
-	highlighted := stream.Connect(ctx, logCh)
+	presets := config.BuildLogPresets(files)
+	ruleGroups := runtime.BuildRuleGroups(ruleSet)
 
 	model := tui.NewModel(tui.ModelConfig{
-		Events:      highlighted,
+		Events:      ctrl.Events(),
 		ThemeName:   *themeFlag,
 		Scrollback:  *scrollbackFlag,
 		Files:       files,
 		ShowAll:     *showAllFlag,
 		MinSeverity: minSeverity,
+		Controller:  ctrl,
+		Presets:     presets,
+		RuleGroups:  ruleGroups,
 	})
 
 	if err := tea.NewProgram(model, tea.WithAltScreen()).Start(); err != nil {

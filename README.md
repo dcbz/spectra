@@ -12,6 +12,7 @@ Spectra Watch is a lush Bubble Tea / Lip Gloss terminal interface tailor-made fo
 - 👁️ Animated ANSI “sentinel” eye in the header so you know the watcher is alive
 - 🔦 Inline highlight fragments for matched substrings plus tag pills and rule badges
 - 🪄 Smooth auto-follow with optional pause (`p`) and follow toggle (`f`)
+- 🎛️ In-app configuration modal (`c`) to switch log files and rule bundles without restarting
 - ♻️ Robust file tailer (`github.com/nxadm/tail`) that survives rotations/restarts
 
 ## Quick Start
@@ -20,11 +21,20 @@ Spectra Watch is a lush Bubble Tea / Lip Gloss terminal interface tailor-made fo
 go run ./cmd/watcher --files=/var/log/auth.log,/var/log/syslog --config=configs/example.rules.yaml --theme=vapor
 ```
 
-Keys: `q` quit, `p` pause (freezes viewport but keeps collecting data), `f` toggle auto-follow, `t` cycle theme.
+Keys: `q` quit, `p` pause (freezes viewport but keeps collecting data), `f` toggle auto-follow, `t` cycle theme, `c` open the configuration modal.
 
 Navigation: `↑`/`↓` move selection, `PgUp`/`PgDn` page through results, `Enter` opens the alert detail modal (press `Enter` or `Esc` again to dismiss).
 
-Add `--show-all` to include every log line, and `--min-severity=high` (or similar) to dial-in the signal you want.
+Add `--show-all` to include every log line, and `--min-severity=high` (or similar) to dial-in the signal you want. Press `c` at any time to swap between curated log files (auth.log, syslog, sshd, etc.) and enable or disable rule groups based on tags.
+
+### Configuration Modal
+
+Tap `c` to surface a centered modal with two panes:
+
+- **Log files** – curated presets (auth.log, secure, syslog, sshd) plus any custom paths you passed via `--files`. Toggle entries with `space`; unavailable files are dimmed.
+- **Rule groups** – automatically generated from rule tags (ssh, sudo, kernel, cron…). leave everything unchecked to stream all rules, or cherry-pick subsets to focus alerts.
+
+Use `tab` (or ←/→) to switch panes, `↑/↓` to move, `enter` to apply, and `esc` to close. Changes take effect immediately with no restart.
 
 ## Screenshots
 

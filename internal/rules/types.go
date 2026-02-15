@@ -94,6 +94,33 @@ func (rs RuleSet) Match(line string) (Match, bool) {
 	return Match{}, false
 }
 
+// FilterByTags returns a new ruleset containing only rules that match any tag in the provided selection.
+func (rs RuleSet) FilterByTags(tags []string) RuleSet {
+	if len(tags) == 0 {
+		return rs
+	}
+	selected := make(map[string]struct{}, len(tags))
+	for _, tag := range tags {
+		if tag == "" {
+			continue
+		}
+		selected[strings.ToLower(tag)] = struct{}{}
+	}
+	if len(selected) == 0 {
+		return rs
+	}
+	filtered := make([]Rule, 0, len(rs.Rules))
+	for _, rule := range rs.Rules {
+		for _, tag := range rule.Tags {
+			if _, ok := selected[strings.ToLower(tag)]; ok {
+				filtered = append(filtered, rule)
+				break
+			}
+		}
+	}
+	return RuleSet{Rules: filtered}
+}
+
 func (rs RuleSet) sortedRules() []Rule {
 	copyRules := make([]Rule, len(rs.Rules))
 	copy(copyRules, rs.Rules)

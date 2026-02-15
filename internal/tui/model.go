@@ -9,9 +9,11 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	"watcher/internal/config"
 	"watcher/internal/highlight"
 	"watcher/internal/pipeline"
 	"watcher/internal/rules"
+	"watcher/internal/runtime"
 )
 
 // ModelConfig wires the data stream into the UI.
@@ -22,6 +24,9 @@ type ModelConfig struct {
 	Files       []string
 	ShowAll     bool
 	MinSeverity rules.Severity
+	Controller  *runtime.Controller
+	Presets     []config.LogPreset
+	RuleGroups  []runtime.RuleGroup
 }
 
 // Model renders a colorful monitoring dashboard.
@@ -37,6 +42,8 @@ type Model struct {
 	shimmer        bool
 	eyeFrame       int
 	sidebarWidth   int
+	activeFiles    []string
+	activeTags     []string
 	counts         map[rules.Severity]int
 	lastRule       string
 	notification   string
@@ -45,8 +52,11 @@ type Model struct {
 	detailOpen     bool
 	detailViewport viewport.Model
 	detailContent  string
+	config         configState
 	windowWidth    int
 	windowHeight   int
+	showHeader     bool
+	showStatus     bool
 }
 
 type displayLine struct {
@@ -87,9 +97,14 @@ func NewModel(cfg ModelConfig) Model {
 		scrollback:     scrollback,
 		follow:         true,
 		sidebarWidth:   30,
+		activeFiles:    append([]string{}, cfg.Files...),
+		activeTags:     nil,
 		counts:         make(map[rules.Severity]int),
 		selectedIndex:  -1,
 		detailViewport: detailVP,
+		config:         newConfigState(),
+		showHeader:     true,
+		showStatus:     true,
 	}
 }
 
@@ -121,6 +136,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.windowWidth = msg.Width
 		m.windowHeight = msg.Height
+		if m.windowWidth < m.sidebarWidth+20 {
+			m.sidebarWidth = clamp(m.windowWidth/3, 18, 40)
+		}
 		paneFrameW, paneFrameH := m.theme.Pane.GetFrameSize()
 		sidebarFrameW, _ := m.theme.Sidebar.GetFrameSize()
 		sidebarTotal := m.sidebarWidth + sidebarFrameW
@@ -134,15 +152,34 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.viewport.Width = contentWidth
 
+		m.showHeader = true
+		m.showStatus = true
 		headerHeight := lipgloss.Height(m.renderHeader())
 		statusHeight := lipgloss.Height(m.renderStatus())
+		minBody := 3
+		if msg.Height > 0 {
+			if headerHeight+statusHeight+minBody > msg.Height {
+				m.showHeader = false
+				headerHeight = 0
+				if statusHeight+minBody > msg.Height {
+					m.showStatus = false
+					statusHeight = 0
+				}
+			}
+		}
 		totalHeight := msg.Height - headerHeight - statusHeight
-		if totalHeight < paneFrameH+1 {
-			totalHeight = paneFrameH + 1
+		if totalHeight < minBody {
+			totalHeight = minBody
 		}
 		contentHeight := totalHeight - paneFrameH
-		if contentHeight < 3 {
-			contentHeight = 3
+		if contentHeight < 1 {
+			contentHeight = 1
+		}
+		if contentHeight > totalHeight {
+			contentHeight = totalHeight
+		}
+		if contentHeight > msg.Height {
+			contentHeight = msg.Height
 		}
 		m.viewport.Height = contentHeight
 		m.viewport.SetContent(m.renderLogContent())
@@ -151,6 +188,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.updateDetailViewportSize()
 		}
 	case tea.KeyMsg:
+		if m.config.open {
+			return m.handleConfigKey(msg)
+		}
 		if m.detailOpen {
 			switch msg.String() {
 			case "enter", "esc", "q":
@@ -187,6 +227,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.follow = !m.follow
 		case "t":
 			m.theme = themeByName(nextTheme(m.theme.Name))
+		case "c":
+			m.openConfig()
 		}
 	case logMsg:
 		return m.consumeLog(msg)
@@ -201,6 +243,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, pulse()
 	case streamClosedMsg:
 		m.notification = "stream closed"
+	case configResultMsg:
+		m.config.applying = false
+		if msg.err != nil {
+			m.config.errorMsg = msg.err.Error()
+			return m, nil
+		}
+		m.config.errorMsg = ""
+		m.config.open = false
+		m.activeFiles = append([]string{}, msg.files...)
+		m.activeTags = append([]string{}, msg.tags...)
+		m.notification = fmt.Sprintf("watching %d files", len(msg.files))
+		m.notificationT = time.Now()
 	}
 
 	var cmd tea.Cmd
@@ -443,36 +497,74 @@ func (m Model) renderDetailModal() string {
 }
 
 func (m Model) View() string {
-	paneFrameW, paneFrameH := m.theme.Pane.GetFrameSize()
-	paneWidth := m.viewport.Width + paneFrameW
-	paneView := m.theme.Pane.Width(paneWidth).Render(m.viewport.View())
-	_, sidebarFrameH := m.theme.Sidebar.GetFrameSize()
-	sidebarView := m.theme.Sidebar.Width(m.sidebarWidth).Render(m.renderSidebar())
+	// Clamp sidebar width for very small terminals so panes don't collapse.
+	minSidebar := 20
+	maxSidebar := 40
+	sidebarWidth := m.sidebarWidth
+	if m.windowWidth > 0 {
+		avail := m.windowWidth - 10
+		if avail < minSidebar {
+			avail = minSidebar
+		}
+		if avail < sidebarWidth {
+			sidebarWidth = avail
+		}
+	}
+	if sidebarWidth < minSidebar {
+		sidebarWidth = minSidebar
+	}
+	if sidebarWidth > maxSidebar {
+		sidebarWidth = maxSidebar
+	}
+	m.sidebarWidth = sidebarWidth
 
-	paneHeight := lipgloss.Height(paneView)
-	sidebarHeight := lipgloss.Height(sidebarView)
-	minPaneHeight := m.viewport.Height + paneFrameH
-	if paneHeight < minPaneHeight {
-		paneView = lipgloss.NewStyle().Height(minPaneHeight).Render(paneView)
-		paneHeight = minPaneHeight
+	paneFrameW, paneFrameH := m.theme.Pane.GetFrameSize()
+	bodyHeight := m.viewport.Height + paneFrameH
+	if bodyHeight < 3 {
+		bodyHeight = 3
 	}
-	minSidebarHeight := m.viewport.Height + sidebarFrameH
-	if sidebarHeight < minSidebarHeight {
-		sidebarView = lipgloss.NewStyle().Height(minSidebarHeight).Render(sidebarView)
-		sidebarHeight = minSidebarHeight
+	if m.windowHeight > 0 && bodyHeight > m.windowHeight {
+		bodyHeight = m.windowHeight
 	}
-	maxHeight := paneHeight
-	if sidebarHeight > maxHeight {
-		maxHeight = sidebarHeight
+	paneWidth := m.viewport.Width + paneFrameW
+	if paneWidth < 10 {
+		paneWidth = 10
 	}
-	paneView = lipgloss.NewStyle().Height(maxHeight).Render(paneView)
-	sidebarView = lipgloss.NewStyle().Height(maxHeight).Render(sidebarView)
+	paneView := m.theme.Pane.Width(paneWidth).Render(m.viewport.View())
+	sidebarContent := m.renderSidebar(bodyHeight)
+	sidebarPane := m.theme.Sidebar.Width(m.sidebarWidth)
+	sidebarView := sidebarPane.Render(sidebarContent)
+
+	paneView = lipgloss.NewStyle().Height(bodyHeight).Render(paneView)
+	sidebarView = lipgloss.NewStyle().Height(bodyHeight).Render(sidebarView)
 	body := lipgloss.JoinHorizontal(lipgloss.Top, paneView, sidebarView)
 	header := m.renderHeader()
 	status := m.renderStatus()
-	base := lipgloss.JoinVertical(lipgloss.Left, header, body, status)
+	segments := make([]string, 0, 3)
+	if header != "" {
+		segments = append(segments, header)
+	}
+	segments = append(segments, body)
+	if status != "" {
+		segments = append(segments, status)
+	}
+	base := lipgloss.JoinVertical(lipgloss.Left, segments...)
+	if m.config.open {
+		modal := m.renderConfigModal()
+		width := m.windowWidth
+		height := m.windowHeight
+		if width <= 0 {
+			width = lipgloss.Width(base)
+		}
+		if height <= 0 {
+			height = lipgloss.Height(base)
+		}
+		return lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, modal,
+			lipgloss.WithWhitespaceChars(" "),
+			lipgloss.WithWhitespaceBackground(lipgloss.Color("#05010A")))
+	}
 	if !m.detailOpen {
-		return base
+		return m.constrainToWindow(base)
 	}
 	modal := m.renderDetailModal()
 	width := m.windowWidth
@@ -488,21 +580,51 @@ func (m Model) View() string {
 		lipgloss.WithWhitespaceBackground(lipgloss.Color("#05010A")))
 }
 
+func (m Model) constrainToWindow(view string) string {
+	if m.windowWidth <= 0 || m.windowHeight <= 0 {
+		return view
+	}
+	return lipgloss.Place(m.windowWidth, m.windowHeight, lipgloss.Left, lipgloss.Top, view,
+		lipgloss.WithWhitespaceChars(" "),
+		lipgloss.WithWhitespaceBackground(lipgloss.Color("#05010A")))
+}
+
 func (m Model) renderHeader() string {
+	if !m.showHeader {
+		return ""
+	}
 	return m.theme.Header.Render(m.renderHeaderInfo())
 }
 
-func (m Model) renderSidebar() string {
+func (m Model) renderSidebar(maxHeight int) string {
 	sections := []string{}
+	appendSection := func(content string, essential bool) {
+		if strings.TrimSpace(content) == "" {
+			return
+		}
+		if maxHeight > 0 {
+			candidate := append(append([]string{}, sections...), content)
+			height := lipgloss.Height(strings.Join(candidate, "\n\n"))
+			if height > maxHeight && !essential {
+				return
+			}
+		}
+		sections = append(sections, content)
+	}
+
 	if eye := m.renderEyeball(); strings.TrimSpace(eye) != "" {
-		sections = append(sections, eye)
+		appendSection(eye, false)
 	}
 	var files strings.Builder
 	files.WriteString(m.theme.Header.Render("files"))
-	for _, file := range m.cfg.Files {
-		files.WriteString("\n" + m.theme.PillStyle.Render(file))
+	if len(m.activeFiles) == 0 {
+		files.WriteString("\n" + m.theme.TagStyle.Render("no files selected"))
+	} else {
+		for _, file := range m.activeFiles {
+			files.WriteString("\n" + m.theme.PillStyle.Render(file))
+		}
 	}
-	sections = append(sections, files.String())
+	appendSection(files.String(), true)
 
 	var pulse strings.Builder
 	pulse.WriteString(m.theme.Header.Render("pulse"))
@@ -518,21 +640,24 @@ func (m Model) renderSidebar() string {
 		pill := m.theme.PillStyle.Copy().Inherit(m.severityStyle(sev)).Render(fmt.Sprintf("%s %d", strings.ToUpper(string(sev)), count))
 		pulse.WriteString("\n" + pill)
 	}
-	sections = append(sections, pulse.String())
+	appendSection(pulse.String(), false)
 
 	lastSection := fmt.Sprintf("%s\n%s", m.theme.Header.Render("last"), m.theme.TagStyle.Render(coalesce(m.lastRule, "—")))
-	sections = append(sections, lastSection)
+	appendSection(lastSection, true)
 
 	if m.notification != "" {
 		alertStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("#FF61D8")).Padding(0, 1)
 		note := fmt.Sprintf("%s\n%s", m.theme.Header.Render("signal"), alertStyle.Render(m.notification))
-		sections = append(sections, note)
+		appendSection(note, true)
 	}
 
 	return strings.Join(sections, "\n\n")
 }
 
 func (m Model) renderStatus() string {
+	if !m.showStatus {
+		return ""
+	}
 	state := "streaming"
 	if m.paused {
 		state = "paused"
@@ -541,7 +666,7 @@ func (m Model) renderStatus() string {
 	if m.shimmer {
 		glow = "✦"
 	}
-	content := fmt.Sprintf("%s %s  ·  ↑/↓ select  ·  PgUp/PgDn page  ·  enter detail  ·  esc close  ·  p pause  ·  f follow  ·  t theme  ·  q quit", glow, state)
+	content := fmt.Sprintf("%s %s  ·  ↑/↓ select  ·  PgUp/PgDn page  ·  enter detail  ·  esc close  ·  p pause  ·  f follow  ·  t theme  ·  c configure  ·  q quit", glow, state)
 	paneFrameW, _ := m.theme.Pane.GetFrameSize()
 	sidebarFrameW, _ := m.theme.Sidebar.GetFrameSize()
 	width := m.viewport.Width + paneFrameW + m.sidebarWidth + sidebarFrameW
@@ -660,6 +785,16 @@ func centerText(line string, width int) string {
 	left := pad / 2
 	right := pad - left
 	return strings.Repeat(" ", left) + line + strings.Repeat(" ", right)
+}
+
+func clamp(val, min, max int) int {
+	if val < min {
+		return min
+	}
+	if val > max {
+		return max
+	}
+	return val
 }
 
 var eyeFrames = []string{
