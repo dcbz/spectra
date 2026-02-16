@@ -1,6 +1,6 @@
 # Spectra Watch
 
-Spectra Watch is a lush Bubble Tea / Lip Gloss terminal interface tailor-made for security-focused log watching. It tails multiple Linux log files, runs every line through a modular regex ruleset, then paints the terminal with neon gradients, animated cues, and severity-driven accents—perfect for rice screenshots.
+Spectra Watch is a lush Bubble Tea / Lip Gloss terminal interface tailor-made for security-focused log watching. It tails multiple log files (Linux and macOS), runs every line through a modular regex ruleset, then paints the terminal with neon gradients, animated cues, and severity-driven accents—perfect for rice screenshots.
 
 ## Features
 
@@ -18,14 +18,58 @@ Spectra Watch is a lush Bubble Tea / Lip Gloss terminal interface tailor-made fo
 ## Quick Start
 
 ```bash
-go run ./cmd/watcher --files=/var/log/auth.log,/var/log/syslog --config=configs/example.rules.yaml --theme=vapor
+# macOS with auto-detection
+./watch /tmp/spectra-test.log
+
+# Or explicitly specify files and config
+./bin/spectra-watch --files=/var/log/system.log --config=configs/macos.rules.yaml
+
+# Linux
+./bin/spectra-watch --files=/var/log/auth.log,/var/log/syslog --config=configs/example.rules.yaml
 ```
+
+**Note:** The `--files` flag is required. There is no default to ensure cross-platform compatibility.
 
 Keys: `q` quit, `p` pause (freezes viewport but keeps collecting data), `f` toggle auto-follow, `t` cycle theme, `c` open the configuration modal.
 
 Navigation: `↑`/`↓` move selection, `PgUp`/`PgDn` page through results, `Enter` opens the alert detail modal (press `Enter` or `Esc` again to dismiss).
 
 Add `--show-all` to include every log line, and `--min-severity=high` (or similar) to dial-in the signal you want. Press `c` at any time to swap between curated log files (auth.log, syslog, sshd, etc.) and enable or disable rule groups based on tags.
+
+### macOS Testing
+
+The project includes macOS-specific rules and native unified logging support:
+
+```bash
+# EASIEST: Built-in macOS unified log streaming ⭐
+./bin/spectra-watch --macos
+
+# Or test with synthetic data first
+./test_macos_logs.sh
+./bin/spectra-watch --files=/tmp/spectra-test.log --config=configs/macos.rules.yaml
+
+# Export unified log snapshot
+log show --style syslog --last 1h > /tmp/macos-recent.log
+./bin/spectra-watch --files=/tmp/macos-recent.log --config=configs/macos.rules.yaml
+```
+
+**The `--macos` flag automatically:**
+- ✅ Streams unified log (includes sudo, auth, kernel, everything)
+- ✅ Uses macOS rules config by default
+- ✅ Cleans up temp files on exit
+- ✅ No manual setup needed
+
+See [SUDO_LOGGING.md](SUDO_LOGGING.md) for why unified logging is necessary.
+
+The `macos.rules.yaml` config includes 53 patterns for:
+- Open Directory authentication failures
+- Keychain access violations
+- Kernel panics and APFS errors
+- Crash reporter events
+- Sandbox violations
+- Firewall blocks
+- XPC service failures
+- And more macOS-specific log patterns
 
 ### Configuration Modal
 
