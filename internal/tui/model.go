@@ -2,6 +2,9 @@ package tui
 
 import (
 	"fmt"
+	"io"
+	"os/exec"
+	goruntime "runtime"
 	"strings"
 	"time"
 	"unicode"
@@ -53,11 +56,16 @@ type Model struct {
 	detailOpen     bool
 	detailViewport viewport.Model
 	detailContent  string
+	detailLine     displayLine
+	helpOpen       bool
+	helpViewport   viewport.Model
 	config         configState
 	windowWidth    int
 	windowHeight   int
 	showHeader     bool
 	showStatus     bool
+	filteredRules  map[string]bool
+	hiddenIndices  map[int]bool
 }
 
 type displayLine struct {
@@ -68,6 +76,7 @@ type displayLine struct {
 	Fragments []highlight.Fragment
 	Tags      []string
 	Text      string
+	Index     int
 }
 
 type logMsg pipeline.HighlightedEvent
@@ -90,6 +99,7 @@ func NewModel(cfg ModelConfig) Model {
 	vp := viewport.New(80, 24)
 	vp.SetContent("booting logstream…")
 	detailVP := viewport.New(60, 20)
+	helpVP := viewport.New(60, 20)
 	return Model{
 		cfg:            cfg,
 		viewport:       vp,
@@ -103,9 +113,14 @@ func NewModel(cfg ModelConfig) Model {
 		counts:         make(map[rules.Severity]int),
 		selectedIndex:  -1,
 		detailViewport: detailVP,
+		helpViewport:   helpVP,
 		config:         newConfigState(),
+		windowWidth:    80,
+		windowHeight:   24,
 		showHeader:     true,
 		showStatus:     true,
+		filteredRules:  make(map[string]bool),
+		hiddenIndices:  make(map[int]bool),
 	}
 }
 
@@ -137,6 +152,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.windowWidth = msg.Width
 		m.windowHeight = msg.Height
+
+		if msg.Width < 10 {
+			msg.Width = 80
+		}
+		if msg.Height < 5 {
+			msg.Height = 24
+		}
+
 		if m.windowWidth < m.sidebarWidth+20 {
 			m.sidebarWidth = clamp(m.windowWidth/3, 18, 40)
 		}
@@ -158,17 +181,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		headerHeight := lipgloss.Height(m.renderHeader())
 		statusHeight := lipgloss.Height(m.renderStatus())
 		minBody := 3
-		if msg.Height > 0 {
-			if headerHeight+statusHeight+minBody > msg.Height {
-				m.showHeader = false
-				headerHeight = 0
-				if statusHeight+minBody > msg.Height {
-					m.showStatus = false
-					statusHeight = 0
-				}
+		availableHeight := msg.Height
+		if headerHeight+statusHeight+minBody > availableHeight {
+			m.showHeader = false
+			headerHeight = 0
+			if statusHeight+minBody > availableHeight {
+				m.showStatus = false
+				statusHeight = 0
 			}
 		}
-		totalHeight := msg.Height - headerHeight - statusHeight
+		totalHeight := availableHeight - headerHeight - statusHeight
 		if totalHeight < minBody {
 			totalHeight = minBody
 		}
@@ -176,26 +198,36 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if contentHeight < 1 {
 			contentHeight = 1
 		}
-		if contentHeight > totalHeight {
-			contentHeight = totalHeight
-		}
-		if contentHeight > msg.Height {
-			contentHeight = msg.Height
-		}
 		m.viewport.Height = contentHeight
 		m.viewport.SetContent(m.renderLogContent())
 		m.ensureSelectionVisible()
 		if m.detailOpen {
 			m.updateDetailViewportSize()
 		}
+		if m.helpOpen {
+			m.updateHelpViewportSize()
+		}
 	case tea.KeyMsg:
 		if m.config.open {
 			return m.handleConfigKey(msg)
+		}
+		if m.helpOpen {
+			switch msg.String() {
+			case "q", "esc", "enter", "?":
+				m.helpOpen = false
+				return m, nil
+			default:
+				var cmd tea.Cmd
+				m.helpViewport, cmd = m.helpViewport.Update(msg)
+				return m, cmd
+			}
 		}
 		if m.detailOpen {
 			switch msg.String() {
 			case "enter", "esc", "q":
 				m.closeDetail()
+			case "y", "c":
+				m.copyDetailToClipboard()
 			default:
 				var cmd tea.Cmd
 				m.detailViewport, cmd = m.detailViewport.Update(msg)
@@ -206,6 +238,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "ctrl+c", "q":
 			return m, tea.Quit
+		case "?":
+			m.openHelp()
+			return m, nil
 		case "up":
 			m.moveSelection(-1)
 		case "down":
@@ -216,6 +251,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.pageSelection(1)
 		case "enter":
 			m.openDetail()
+		case "h":
+			m.hideCurrentLine()
+		case "x":
+			m.filterCurrentRule()
+		case "r":
+			m.resetFilters()
 		case "p":
 			m.paused = !m.paused
 			if !m.paused {
@@ -280,11 +321,22 @@ func (m Model) consumeLog(evt logMsg) (tea.Model, tea.Cmd) {
 		Fragments: evt.Fragments,
 		Tags:      append([]string{}, evt.Tags...),
 		Text:      evt.Line,
+		Index:     len(m.lines),
 	}
 	m.lines = append(m.lines, dl)
 	if len(m.lines) > m.scrollback {
 		trim := len(m.lines) - m.scrollback
 		m.lines = m.lines[trim:]
+		newHidden := make(map[int]bool)
+		for idx := range m.hiddenIndices {
+			if idx >= trim {
+				newHidden[idx-trim] = true
+			}
+		}
+		m.hiddenIndices = newHidden
+		for i := range m.lines {
+			m.lines[i].Index = i
+		}
 		if m.selectedIndex >= 0 {
 			m.selectedIndex -= trim
 			if m.selectedIndex < 0 {
@@ -292,10 +344,11 @@ func (m Model) consumeLog(evt logMsg) (tea.Model, tea.Cmd) {
 			}
 		}
 	}
-	if len(m.lines) == 0 {
+	visibleLines := m.getVisibleLines()
+	if len(visibleLines) == 0 {
 		m.selectedIndex = -1
 	} else if m.follow || m.selectedIndex == -1 {
-		m.selectedIndex = len(m.lines) - 1
+		m.selectedIndex = len(visibleLines) - 1
 	}
 	m.counts[evt.Severity]++
 	if evt.RuleName != "" {
@@ -311,26 +364,24 @@ func (m Model) consumeLog(evt logMsg) (tea.Model, tea.Cmd) {
 			m.ensureSelectionVisible()
 		}
 	}
-	if m.detailOpen {
-		m.refreshDetailContent()
-	}
 	return m, m.listen()
 }
 
 func (m *Model) moveSelection(delta int) {
-	if len(m.lines) == 0 {
+	visibleLines := m.getVisibleLines()
+	if len(visibleLines) == 0 {
 		m.selectedIndex = -1
 		return
 	}
 	if m.selectedIndex < 0 {
-		m.selectedIndex = len(m.lines) - 1
+		m.selectedIndex = len(visibleLines) - 1
 	}
 	target := m.selectedIndex + delta
 	if target < 0 {
 		target = 0
 	}
-	if target >= len(m.lines) {
-		target = len(m.lines) - 1
+	if target >= len(visibleLines) {
+		target = len(visibleLines) - 1
 	}
 	if target == m.selectedIndex {
 		return
@@ -373,34 +424,110 @@ func (m *Model) ensureSelectionVisible() {
 }
 
 func (m Model) selectedLine() (displayLine, bool) {
-	if m.selectedIndex < 0 || m.selectedIndex >= len(m.lines) {
+	visibleLines := m.getVisibleLines()
+	if m.selectedIndex < 0 || m.selectedIndex >= len(visibleLines) {
 		return displayLine{}, false
 	}
-	return m.lines[m.selectedIndex], true
+	return visibleLines[m.selectedIndex], true
+}
+
+func (m *Model) refreshVisibleState() {
+	visibleLines := m.getVisibleLines()
+	if len(visibleLines) == 0 {
+		m.selectedIndex = -1
+	} else if m.selectedIndex >= len(visibleLines) {
+		m.selectedIndex = len(visibleLines) - 1
+	}
+	m.viewport.SetContent(m.renderLogContent())
+	m.ensureSelectionVisible()
+}
+
+func (m *Model) hideCurrentLine() {
+	line, ok := m.selectedLine()
+	if !ok {
+		return
+	}
+	m.hiddenIndices[line.Index] = true
+	m.notification = "Hidden 1 line"
+	m.notificationT = time.Now()
+	m.refreshVisibleState()
+}
+
+func (m *Model) filterCurrentRule() {
+	line, ok := m.selectedLine()
+	if !ok || line.RuleName == "" {
+		return
+	}
+	m.filteredRules[line.RuleName] = true
+	count := 0
+	for _, l := range m.lines {
+		if l.RuleName == line.RuleName {
+			count++
+		}
+	}
+	m.notification = fmt.Sprintf("Filtered rule: %s (%d lines)", line.RuleName, count)
+	m.notificationT = time.Now()
+	m.refreshVisibleState()
+}
+
+func (m *Model) resetFilters() {
+	hiddenCount := len(m.hiddenIndices)
+	ruleCount := len(m.filteredRules)
+	m.filteredRules = make(map[string]bool)
+	m.hiddenIndices = make(map[int]bool)
+	m.notification = fmt.Sprintf("Reset filters (%d lines, %d rules restored)", hiddenCount, ruleCount)
+	m.notificationT = time.Now()
+	m.refreshVisibleState()
+}
+
+func (m Model) getVisibleLines() []displayLine {
+	visible := make([]displayLine, 0, len(m.lines))
+	for _, line := range m.lines {
+		if line.RuleName != "" && m.filteredRules[line.RuleName] {
+			continue
+		}
+		if m.hiddenIndices[line.Index] {
+			continue
+		}
+		visible = append(visible, line)
+	}
+	return visible
 }
 
 func (m *Model) openDetail() {
 	if m.detailOpen {
 		return
 	}
-	if _, ok := m.selectedLine(); !ok {
+	line, ok := m.selectedLine()
+	if !ok {
 		return
 	}
+	m.detailLine = line
 	m.detailOpen = true
 	m.updateDetailViewportSize()
 	m.detailViewport.GotoTop()
+	m.refreshDetailContent()
 }
 
 func (m *Model) closeDetail() {
 	m.detailOpen = false
+	m.detailLine = displayLine{}
+}
+
+func (m *Model) openHelp() {
+	if m.helpOpen {
+		return
+	}
+	m.helpOpen = true
+	m.updateHelpViewportSize()
+	m.helpViewport.GotoTop()
 }
 
 func (m *Model) refreshDetailContent() {
-	line, ok := m.selectedLine()
-	if !ok {
+	if !m.detailOpen {
 		m.detailContent = "no alert selected"
 	} else {
-		m.detailContent = m.buildDetailContent(line)
+		m.detailContent = m.buildDetailContent(m.detailLine)
 	}
 	width := m.detailViewport.Width
 	if width <= 0 {
@@ -485,10 +612,110 @@ func (m *Model) updateDetailViewportSize() {
 	m.refreshDetailContent()
 }
 
+func (m *Model) updateHelpViewportSize() {
+	if !m.helpOpen {
+		return
+	}
+	width, height := m.modalSize()
+	innerWidth := width - (modalPaddingX * 2) - 2
+	if innerWidth < 40 {
+		innerWidth = 40
+	}
+	innerHeight := height - (modalPaddingY * 2) - 4
+	if innerHeight < 10 {
+		innerHeight = 10
+	}
+	m.helpViewport.Width = innerWidth
+	m.helpViewport.Height = innerHeight
+	helpText := `
+NAVIGATION
+  ↑ / ↓         Move selection up/down
+  PgUp / PgDn   Page up/down
+  
+ACTIONS
+  Enter         Open alert details
+  h             Hide current line
+  x             Filter out all logs of this rule type
+  r             Reset all filters (show everything)
+  
+DETAIL VIEW (when alert open)
+  y / c         Copy alert details to clipboard
+  ↑ / ↓         Scroll detail content
+  Enter / Esc   Close detail view
+  
+PLAYBACK
+  p             Pause/unpause log streaming
+  f             Toggle auto-follow (scroll to bottom)
+  
+APPEARANCE
+  t             Cycle themes (vapor → midnight → dusk)
+  
+OTHER
+  ?             Show this help
+  q / Ctrl+C    Quit application
+  
+TIPS
+  • Pause (p) to stop scrolling while reviewing logs
+  • Filter (x) noisy rules to focus on important events
+  • Copy (y/c) alert details to share with your team
+  • Fullscreen terminal shows severity counts in sidebar
+`
+	m.helpViewport.SetContent(strings.TrimSpace(helpText))
+}
+
+func (m *Model) copyDetailToClipboard() {
+	if !m.detailOpen {
+		m.notification = "No alert to copy"
+		m.notificationT = time.Now()
+		return
+	}
+	content := m.buildDetailContent(m.detailLine)
+	var cmd *exec.Cmd
+	if goruntime.GOOS == "darwin" {
+		cmd = exec.Command("pbcopy")
+	} else if goruntime.GOOS == "linux" {
+		if _, err := exec.LookPath("xclip"); err == nil {
+			cmd = exec.Command("xclip", "-selection", "clipboard")
+		} else if _, err := exec.LookPath("xsel"); err == nil {
+			cmd = exec.Command("xsel", "--clipboard", "--input")
+		}
+	}
+	if cmd == nil {
+		m.notification = "Clipboard not supported on this system"
+		m.notificationT = time.Now()
+		return
+	}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		m.notification = fmt.Sprintf("Clipboard error: %v", err)
+		m.notificationT = time.Now()
+		return
+	}
+	if err := cmd.Start(); err != nil {
+		m.notification = fmt.Sprintf("Clipboard error: %v", err)
+		m.notificationT = time.Now()
+		return
+	}
+	if _, err := io.WriteString(stdin, content); err != nil {
+		stdin.Close()
+		m.notification = fmt.Sprintf("Clipboard error: %v", err)
+		m.notificationT = time.Now()
+		return
+	}
+	stdin.Close()
+	if err := cmd.Wait(); err != nil {
+		m.notification = fmt.Sprintf("Clipboard error: %v", err)
+		m.notificationT = time.Now()
+		return
+	}
+	m.notification = "Copied alert details to clipboard"
+	m.notificationT = time.Now()
+}
+
 func (m Model) renderDetailModal() string {
 	width, height := m.modalSize()
 	title := m.theme.Header.Render("alert details")
-	instructions := m.theme.TagStyle.Render("enter/esc close · arrows scroll")
+	instructions := m.theme.TagStyle.Render("y/c copy · enter/esc close · arrows scroll")
 	body := m.detailViewport.View()
 	modalStyle := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
@@ -502,50 +729,107 @@ func (m Model) renderDetailModal() string {
 	return modalStyle.Render(content)
 }
 
+func (m Model) renderHelpModal() string {
+	width, height := m.modalSize()
+	title := m.theme.Header.Render("keyboard shortcuts")
+	instructions := lipgloss.NewStyle().
+		Foreground(m.accentColor()).
+		Italic(true).
+		Render("↑/↓ scroll · q/esc/enter/? close")
+	body := m.helpViewport.View()
+	modalStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(m.accentColor()).
+		Width(width).
+		Height(height).
+		Padding(modalPaddingY, modalPaddingX).
+		Background(lipgloss.Color("#1A0F1F")).
+		Align(lipgloss.Left)
+	content := lipgloss.JoinVertical(lipgloss.Left, title, instructions, body)
+	return modalStyle.Render(content)
+}
+
 func (m Model) View() string {
-	// Clamp sidebar width for very small terminals so panes don't collapse.
-	minSidebar := 20
-	maxSidebar := 40
-	sidebarWidth := m.sidebarWidth
-	if m.windowWidth > 0 {
-		avail := m.windowWidth - 10
-		if avail < minSidebar {
-			avail = minSidebar
-		}
-		if avail < sidebarWidth {
-			sidebarWidth = avail
-		}
+	if m.windowWidth <= 0 || m.windowHeight <= 0 {
+		return "Loading..."
 	}
-	if sidebarWidth < minSidebar {
-		sidebarWidth = minSidebar
-	}
-	if sidebarWidth > maxSidebar {
-		sidebarWidth = maxSidebar
+
+	sidebarWidth := clamp(m.sidebarWidth, 20, 40)
+	if m.windowWidth < sidebarWidth+20 {
+		sidebarWidth = clamp(m.windowWidth/3, 18, 40)
 	}
 	m.sidebarWidth = sidebarWidth
 
-	paneFrameW, paneFrameH := m.theme.Pane.GetFrameSize()
-	bodyHeight := m.viewport.Height + paneFrameH
-	if bodyHeight < 3 {
-		bodyHeight = 3
+	header := ""
+	headerHeight := 0
+	if m.showHeader {
+		header = m.renderHeader()
+		headerHeight = lipgloss.Height(header)
 	}
-	if m.windowHeight > 0 && bodyHeight > m.windowHeight {
-		bodyHeight = m.windowHeight
-	}
-	paneWidth := m.viewport.Width + paneFrameW
-	if paneWidth < 10 {
-		paneWidth = 10
-	}
-	paneView := m.theme.Pane.Width(paneWidth).Render(m.viewport.View())
-	sidebarContent := m.renderSidebar(bodyHeight)
-	sidebarPane := m.theme.Sidebar.Width(m.sidebarWidth)
-	sidebarView := sidebarPane.Render(sidebarContent)
 
-	paneView = lipgloss.NewStyle().Height(bodyHeight).Render(paneView)
-	sidebarView = lipgloss.NewStyle().Height(bodyHeight).Render(sidebarView)
+	status := ""
+	statusHeight := 0
+	if m.showStatus {
+		status = m.renderStatus()
+		statusHeight = lipgloss.Height(status)
+	}
+
+	availableBodyHeight := m.windowHeight - headerHeight - statusHeight
+	if availableBodyHeight < 3 {
+		availableBodyHeight = 3
+	}
+
+	paneView := m.theme.Pane.Render(m.viewport.View())
+	sidebarContent := m.renderSidebar(availableBodyHeight)
+	sidebarView := m.theme.Sidebar.Render(sidebarContent)
+
+	paneHeight := lipgloss.Height(paneView)
+	sidebarHeight := lipgloss.Height(sidebarView)
+	maxHeight := paneHeight
+	if sidebarHeight > maxHeight {
+		maxHeight = sidebarHeight
+	}
+
+	if maxHeight > availableBodyHeight {
+		_, paneFrameH := m.theme.Pane.GetFrameSize()
+		desiredViewportHeight := availableBodyHeight - paneFrameH
+		if desiredViewportHeight < 1 {
+			desiredViewportHeight = 1
+		}
+
+		viewportContent := m.viewport.View()
+		lines := strings.Split(viewportContent, "\n")
+		if len(lines) > desiredViewportHeight {
+			lines = lines[:desiredViewportHeight]
+			viewportContent = strings.Join(lines, "\n")
+		}
+
+		paneView = m.theme.Pane.Render(viewportContent)
+
+		_, sidebarFrameH := m.theme.Sidebar.GetFrameSize()
+		desiredSidebarHeight := availableBodyHeight - sidebarFrameH
+		if desiredSidebarHeight < 1 {
+			desiredSidebarHeight = 1
+		}
+		sidebarContent = m.renderSidebar(desiredSidebarHeight)
+		sidebarView = m.theme.Sidebar.Render(sidebarContent)
+
+		paneHeight = lipgloss.Height(paneView)
+		sidebarHeight = lipgloss.Height(sidebarView)
+	}
+
+	targetHeight := paneHeight
+	if sidebarHeight > targetHeight {
+		targetHeight = sidebarHeight
+	}
+	if paneHeight < targetHeight {
+		paneView = lipgloss.NewStyle().Height(targetHeight).Render(paneView)
+	}
+	if sidebarHeight < targetHeight {
+		sidebarView = lipgloss.NewStyle().Height(targetHeight).Render(sidebarView)
+	}
+
 	body := lipgloss.JoinHorizontal(lipgloss.Top, paneView, sidebarView)
-	header := m.renderHeader()
-	status := m.renderStatus()
 	segments := make([]string, 0, 3)
 	if header != "" {
 		segments = append(segments, header)
@@ -554,45 +838,55 @@ func (m Model) View() string {
 	if status != "" {
 		segments = append(segments, status)
 	}
-	base := lipgloss.JoinVertical(lipgloss.Left, segments...)
-	if m.config.open {
-		modal := m.renderConfigModal()
-		width := m.windowWidth
-		height := m.windowHeight
-		if width <= 0 {
-			width = lipgloss.Width(base)
+	result := lipgloss.JoinVertical(lipgloss.Left, segments...)
+
+	if lipgloss.Height(result) > m.windowHeight {
+		lines := strings.Split(result, "\n")
+		if len(lines) > m.windowHeight {
+			lines = lines[:m.windowHeight]
 		}
-		if height <= 0 {
-			height = lipgloss.Height(base)
-		}
-		return lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, modal,
+		result = strings.Join(lines, "\n")
+	}
+
+	if m.helpOpen {
+		modal := m.renderHelpModal()
+		return lipgloss.Place(m.windowWidth, m.windowHeight, lipgloss.Center, lipgloss.Center, modal,
 			lipgloss.WithWhitespaceChars(" "),
 			lipgloss.WithWhitespaceBackground(lipgloss.Color("#05010A")))
 	}
-	if !m.detailOpen {
-		return m.constrainToWindow(base)
+	if m.config.open {
+		modal := m.renderConfigModal()
+		return lipgloss.Place(m.windowWidth, m.windowHeight, lipgloss.Center, lipgloss.Center, modal,
+			lipgloss.WithWhitespaceChars(" "),
+			lipgloss.WithWhitespaceBackground(lipgloss.Color("#05010A")))
 	}
-	modal := m.renderDetailModal()
-	width := m.windowWidth
-	height := m.windowHeight
-	if width <= 0 {
-		width = lipgloss.Width(base)
+	if m.detailOpen {
+		modal := m.renderDetailModal()
+		return lipgloss.Place(m.windowWidth, m.windowHeight, lipgloss.Center, lipgloss.Center, modal,
+			lipgloss.WithWhitespaceChars(" "),
+			lipgloss.WithWhitespaceBackground(lipgloss.Color("#05010A")))
 	}
-	if height <= 0 {
-		height = lipgloss.Height(base)
-	}
-	return lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, modal,
-		lipgloss.WithWhitespaceChars(" "),
-		lipgloss.WithWhitespaceBackground(lipgloss.Color("#05010A")))
+
+	return result
 }
 
 func (m Model) constrainToWindow(view string) string {
 	if m.windowWidth <= 0 || m.windowHeight <= 0 {
 		return view
 	}
-	return lipgloss.Place(m.windowWidth, m.windowHeight, lipgloss.Left, lipgloss.Top, view,
-		lipgloss.WithWhitespaceChars(" "),
-		lipgloss.WithWhitespaceBackground(lipgloss.Color("#05010A")))
+	viewHeight := lipgloss.Height(view)
+	viewWidth := lipgloss.Width(view)
+	if viewHeight <= m.windowHeight && viewWidth <= m.windowWidth {
+		return view
+	}
+	if viewHeight > m.windowHeight {
+		lines := strings.Split(view, "\n")
+		if len(lines) > m.windowHeight {
+			lines = lines[:m.windowHeight]
+		}
+		view = strings.Join(lines, "\n")
+	}
+	return view
 }
 
 func (m Model) renderHeader() string {
@@ -604,6 +898,8 @@ func (m Model) renderHeader() string {
 
 func (m Model) renderSidebar(maxHeight int) string {
 	sections := []string{}
+	wideTerminal := m.windowWidth > 0 && m.windowWidth > 140
+	mediumTerminal := m.windowWidth > 0 && m.windowWidth > 100
 	appendSection := func(content string, essential bool) {
 		if strings.TrimSpace(content) == "" {
 			return
@@ -618,9 +914,12 @@ func (m Model) renderSidebar(maxHeight int) string {
 		sections = append(sections, content)
 	}
 
-	if eye := m.renderEyeball(); strings.TrimSpace(eye) != "" {
-		appendSection(eye, false)
+	if mediumTerminal {
+		if eye := m.renderEyeball(); strings.TrimSpace(eye) != "" {
+			appendSection(eye, false)
+		}
 	}
+
 	var files strings.Builder
 	files.WriteString(m.theme.Header.Render("files"))
 	if len(m.activeFiles) == 0 {
@@ -632,21 +931,23 @@ func (m Model) renderSidebar(maxHeight int) string {
 	}
 	appendSection(files.String(), true)
 
-	var pulse strings.Builder
-	pulse.WriteString(m.theme.Header.Render("pulse"))
-	order := []rules.Severity{
-		rules.SeverityCritical,
-		rules.SeverityHigh,
-		rules.SeverityMedium,
-		rules.SeverityLow,
-		rules.SeverityNormal,
+	if wideTerminal {
+		var pulse strings.Builder
+		pulse.WriteString(m.theme.Header.Render("pulse"))
+		order := []rules.Severity{
+			rules.SeverityCritical,
+			rules.SeverityHigh,
+			rules.SeverityMedium,
+			rules.SeverityLow,
+			rules.SeverityNormal,
+		}
+		for _, sev := range order {
+			count := m.counts[sev]
+			pill := m.theme.PillStyle.Copy().Inherit(m.severityStyle(sev)).Render(fmt.Sprintf("%s %d", strings.ToUpper(string(sev)), count))
+			pulse.WriteString("\n" + pill)
+		}
+		appendSection(pulse.String(), false)
 	}
-	for _, sev := range order {
-		count := m.counts[sev]
-		pill := m.theme.PillStyle.Copy().Inherit(m.severityStyle(sev)).Render(fmt.Sprintf("%s %d", strings.ToUpper(string(sev)), count))
-		pulse.WriteString("\n" + pill)
-	}
-	appendSection(pulse.String(), false)
 
 	lastSection := fmt.Sprintf("%s\n%s", m.theme.Header.Render("last"), m.theme.TagStyle.Render(coalesce(m.lastRule, "—")))
 	appendSection(lastSection, true)
@@ -657,7 +958,15 @@ func (m Model) renderSidebar(maxHeight int) string {
 		appendSection(note, true)
 	}
 
-	return strings.Join(sections, "\n\n")
+	content := strings.Join(sections, "\n\n")
+	if maxHeight > 0 {
+		currentHeight := lipgloss.Height(content)
+		if currentHeight < maxHeight {
+			padding := maxHeight - currentHeight
+			content = content + strings.Repeat("\n", padding)
+		}
+	}
+	return content
 }
 
 func (m Model) renderStatus() string {
@@ -672,23 +981,34 @@ func (m Model) renderStatus() string {
 	if m.shimmer {
 		glow = "✦"
 	}
-	content := fmt.Sprintf("%s %s  ·  ↑/↓ select  ·  PgUp/PgDn page  ·  enter detail  ·  esc close  ·  p pause  ·  f follow  ·  t theme  ·  c configure  ·  q quit", glow, state)
 	paneFrameW, _ := m.theme.Pane.GetFrameSize()
 	sidebarFrameW, _ := m.theme.Sidebar.GetFrameSize()
-	width := m.viewport.Width + paneFrameW + m.sidebarWidth + sidebarFrameW
-	if width < 10 {
-		width = 10
+	totalWidth := m.viewport.Width + paneFrameW + m.sidebarWidth + sidebarFrameW
+	var content string
+	if totalWidth < 80 {
+		content = fmt.Sprintf("%s %s  ·  ? help  ·  h/x/r  ·  p/f/t/q", glow, state)
+	} else if totalWidth < 120 {
+		content = fmt.Sprintf("%s %s  ·  ? help  ·  h hide  ·  x filter  ·  r reset  ·  p/f/t/q", glow, state)
+	} else {
+		content = fmt.Sprintf("%s %s  ·  ? help  ·  h hide  ·  x filter  ·  r reset  ·  p pause  ·  f follow  ·  t theme  ·  q quit", glow, state)
 	}
-	return m.theme.StatusBar.Width(width).Render(content)
+	if totalWidth < 10 {
+		totalWidth = 10
+	}
+	return m.theme.StatusBar.Width(totalWidth).Render(content)
 }
 
 func (m Model) renderLogContent() string {
-	var rows []string
-	for idx, line := range m.lines {
-		rows = append(rows, m.renderLine(line, idx == m.selectedIndex))
-	}
-	if len(rows) == 0 {
+	visibleLines := m.getVisibleLines()
+	if len(visibleLines) == 0 {
+		if len(m.filteredRules) > 0 || len(m.hiddenIndices) > 0 {
+			return "all lines filtered (press 'r' to reset)"
+		}
 		return "awaiting signals…"
+	}
+	rows := make([]string, 0, len(visibleLines))
+	for idx, line := range visibleLines {
+		rows = append(rows, m.renderLine(line, idx == m.selectedIndex))
 	}
 	return strings.Join(rows, "\n")
 }
@@ -737,20 +1057,35 @@ func (m Model) renderEyeball() string {
 		return ""
 	}
 	frame := strings.TrimSpace(eyeFrames[m.eyeFrame%len(eyeFrames)])
-	cw := m.sidebarContentWidth()
+	sidebarStyle := m.theme.Sidebar
+	actualSidebarWidth := m.sidebarWidth
+	if w := sidebarStyle.GetWidth(); w > 0 {
+		actualSidebarWidth = w
+	}
+	sidebarFrameW, _ := sidebarStyle.GetFrameSize()
+	availableWidth := actualSidebarWidth - sidebarFrameW
+	if availableWidth < 6 {
+		availableWidth = 6
+	}
+	eyeBoxStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(m.accentColor()).
+		Foreground(m.accentColor()).
+		Padding(0, 1)
+	if m.shimmer {
+		eyeBoxStyle = eyeBoxStyle.Bold(true)
+	}
+	eyeBoxFrameW, _ := eyeBoxStyle.GetFrameSize()
+	contentWidth := availableWidth - eyeBoxFrameW
+	if contentWidth < 4 {
+		contentWidth = 4
+	}
 	lines := strings.Split(frame, "\n")
 	for i, line := range lines {
-		lines[i] = centerText(line, cw-4)
+		lines[i] = centerText(line, contentWidth)
 	}
 	block := strings.Join(lines, "\n")
-	if cw < 8 {
-		cw = 8
-	}
-	style := lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(m.accentColor()).Foreground(m.accentColor()).Padding(0, 1).Width(cw)
-	if m.shimmer {
-		style = style.Bold(true)
-	}
-	return style.Render(block)
+	return eyeBoxStyle.Render(block)
 }
 
 func (m Model) renderHeaderInfo() string {
